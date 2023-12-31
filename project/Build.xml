@@ -64,7 +64,12 @@
 	<set name="SLIBEXT" value=".a" unless="windows"/>
 	<set name="SLIBEXT" value=".so" if="webos"/>
 
-	<target id="NDLL" output="${name_prefix}lua${debug_extra}${name_extra}" tool="linker" toolid="${ndll-tool}">
+	<set name="CNE_EXT" value="-windows" if="windows"/>
+	<set name="CNE_EXT" value="-mac" if="mac"/>
+	<set name="CNE_EXT" value="-linux" if="linux"/>
+	<set name="CNE_EXT" value="-android" if="android"/>
+
+	<target id="NDLL" output="lua${CNE_EXT}" tool="linker" toolid="${ndll-tool}">
 		<outdir name="../ndll/${BINDIR}"/>
 		<ext value=".ndll" unless="mobile"/>
 		<files id="lua"/>

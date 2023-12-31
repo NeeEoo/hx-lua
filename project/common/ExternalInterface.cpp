@@ -7,8 +7,10 @@
 #endif
 
 #include <hx/CFFI.h>
+#include <hx/CFFIPrime.h>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 
 extern "C" {
 	#include "lua.h"
@@ -19,16 +21,17 @@ extern "C" {
 vkind kind_lua_vm;
 
 // HACK!!! For some reason this isn't properly defined in neko...
-#if !(defined(IPHONE) || defined(ANDROID))
-#define val_fun_nargs(v)	((vfunction*)(v))->nargs
-#endif
+//#if !(defined(IPHONE) || defined(ANDROID))
+//#define val_fun_nargs(v)	((vfunction*)(v))->nargs
+//#endif
 
 // forward declarations
 int haxe_to_lua(value v, lua_State *l);
 value lua_value_to_haxe(lua_State *l, int lua_v);
 
+// ref: http://stackoverflow.com/questions/1438842/iterating-through-a-lua-table-from-c
 #define BEGIN_TABLE_LOOP(l, v) lua_pushnil(l); \
-	while (lua_next(l, v) != 0) {
+	while (lua_next(l, v < 0 ? v - 1 : v) != 0) { // v-1: the stack index of the table is begin pushed downward due to the lua_pushnil() call
 #define END_TABLE_LOOP(l) lua_pop(l, 1); }
 
 inline value lua_table_to_haxe(lua_State *l, int lua_v)
@@ -41,6 +44,7 @@ inline value lua_table_to_haxe(lua_State *l, int lua_v)
 	BEGIN_TABLE_LOOP(l, lua_v)
 		// check for all number keys (array), otherwise it's an object
 		if (lua_type(l, -2) != LUA_TNUMBER) array = false;
+		else if (lua_tonumber(l, -2) < 1 || fmod(lua_tonumber(l, -2), 1) != 0) array = false;
 
 		field_count += 1;
 	END_TABLE_LOOP(l)
@@ -51,7 +55,16 @@ inline value lua_table_to_haxe(lua_State *l, int lua_v)
 		value *arr = val_array_value(v);
 		BEGIN_TABLE_LOOP(l, lua_v)
 			int index = (int)(lua_tonumber(l, -2) - 1); // lua has 1 based indices instead of 0
-			arr[index] = lua_value_to_haxe(l, lua_v+2);
+			if(arr)
+			{
+				// TODO: some glitch if the index not continuous (i.e. array with "holes")
+				arr[index] = lua_value_to_haxe(l, -1);
+			}
+			else
+			{
+				val_array_set_i(v, index, lua_value_to_haxe(l, -1));
+			}
+			//val_array_set_i(v, index, lua_value_to_haxe(l, lua_v+2));
 		END_TABLE_LOOP(l)
 	}
 	else
@@ -60,7 +73,17 @@ inline value lua_table_to_haxe(lua_State *l, int lua_v)
 		BEGIN_TABLE_LOOP(l, lua_v)
 			// TODO: don't assume string keys
 			const char *key = lua_tostring(l, -2);
-			alloc_field(v, val_id(key), lua_value_to_haxe(l, lua_v+2));
+			switch(lua_type(l, -2))
+			{
+				case LUA_TSTRING:
+					alloc_field(v, val_id(lua_tostring(l, -2)), lua_value_to_haxe(l, -1));
+					break;
+				case LUA_TNUMBER:
+					std::ostringstream ss;
+					ss << lua_tonumber(l, -2);
+					alloc_field(v, val_id(ss.str().c_str()), lua_value_to_haxe(l, -1));
+					break;
+			}
 		END_TABLE_LOOP(l)
 	}
 
@@ -94,6 +117,7 @@ value lua_value_to_haxe(lua_State *l, int lua_v)
 		case LUA_TUSERDATA:
 		case LUA_TTHREAD:
 		case LUA_TLIGHTUSERDATA:
+			v = alloc_null();
 			printf("return value not supported");
 			break;
 	}
@@ -105,9 +129,11 @@ static int haxe_callback(lua_State *l)
 	int num_args = lua_gettop(l);
 	AutoGCRoot *root = (AutoGCRoot *)lua_topointer(l, lua_upvalueindex(1));
 	int expected_args = lua_tonumber(l, lua_upvalueindex(2));
-	if (num_args != expected_args)
+	//printf("Num Args: %i\n", num_args);
+	//printf("Expect Args: %i\n", expected_args);
+	if (expected_args != -1 && num_args != expected_args)
 	{
-		printf("Expected %d arguments, received %d", expected_args, num_args);
+		printf("[hx-lua] Expected %d arguments, received %d\n", expected_args, num_args);
 	}
 	else
 	{
@@ -131,7 +157,14 @@ inline void haxe_array_to_lua(value v, lua_State *l)
 	for (int i = 0; i < size; i++)
 	{
 		lua_pushnumber(l, i + 1); // lua index is 1 based instead of 0
-		haxe_to_lua(arr[i], l);
+		if(arr)
+		{
+			haxe_to_lua(arr[i], l);
+		}
+		else
+		{
+			haxe_to_lua(val_array_i(v, i), l);
+		}
 		lua_settable(l, -3);
 	}
 }
@@ -141,7 +174,7 @@ void haxe_iter_object(value v, field f, void *state)
 	lua_State *l = (lua_State *)state;
 	const char *name = val_string(val_field_name(f));
 	lua_pushstring(l, name);
-	haxe_to_lua(v, l);
+	haxe_to_lua(val_field(v, f), l);
 	lua_settable(l, -3);
 }
 
@@ -149,7 +182,7 @@ void haxe_iter_global(value v, field f, void *state)
 {
 	lua_State *l = (lua_State *)state;
 	const char *name = val_string(val_field_name(f));
-	haxe_to_lua(v, l);
+	haxe_to_lua(val_field(v, f), l);
 	lua_setglobal(l, name);
 }
 
@@ -173,18 +206,21 @@ int haxe_to_lua(value v, lua_State *l)
 		case valtString:
 			lua_pushstring(l, val_string(v));
 			break;
-		case valtFunction:
+		case valtFunction: {
 			// TODO: figure out a way to delete/cleanup the AutoGCRoot pointers
+			int args = val_fun_nargs(v);
 			lua_pushlightuserdata(l, new AutoGCRoot(v));
-			lua_pushnumber(l, val_fun_nargs(v));
+			//printf("Adding function with %i args\n", args);
+			lua_pushnumber(l, args);
 			// using a closure instead of a function so we can add upvalues
 			lua_pushcclosure(l, haxe_callback, 2);
 			break;
+		}
 		case valtArray:
 			haxe_array_to_lua(v, l);
 			break;
 		case valtAbstractBase: // should abstracts be handled??
-			printf("abstracts not supported");
+			printf("abstracts not supported\n");
 			return 0;
 		case valtObject: // falls through
 		case valtEnum: // falls through
@@ -206,6 +242,14 @@ static lua_State *lua_from_handle(value inHandle)
 	return NULL;
 }
 
+value push_haxeval(value inHandle, value val) {
+	lua_State *l = lua_from_handle(inHandle);
+	if (l == NULL) return alloc_int(0);
+
+	return alloc_int(haxe_to_lua(val, l));
+}
+DEFINE_PRIME2v(push_haxeval);
+
 static void release_lua(value inHandle)
 {
 	lua_State *l = lua_from_handle(inHandle);
@@ -222,15 +266,15 @@ static value lua_create()
 	val_gc(result, release_lua);
 	return result;
 }
-DEFINE_PRIM(lua_create, 0);
+DEFINE_PRIME0(lua_create);
 
 static value lua_get_version()
 {
 	return alloc_string(LUA_VERSION);
 }
-DEFINE_PRIM(lua_get_version, 0);
+DEFINE_PRIME0(lua_get_version);
 
-static value lua_load_libs(value inHandle, value inLibs)
+static void lua_load_libs(value inHandle, value inLibs)
 {
 	static const luaL_Reg lualibs[] = {
 		{ "base", luaopen_base },
@@ -255,7 +299,18 @@ static value lua_load_libs(value inHandle, value inLibs)
 			const luaL_Reg *lib = lualibs;
 			for (;lib->func != NULL; lib++)
 			{
-				if (strcmp(val_string(libs[i]), lib->name) == 0)
+				const char* libname;
+
+				if(libs)
+				{
+					libname = val_string(libs[i]);
+				}
+				else
+				{
+					libname = val_string(val_array_i(inLibs, i));
+				}
+
+				if (strcmp(libname, lib->name) == 0)
 				{
 					// printf("loading lua library %s\n", lib->name);
 					luaL_requiref(l, lib->name, lib->func, 1);
@@ -265,11 +320,10 @@ static value lua_load_libs(value inHandle, value inLibs)
 			}
 		}
 	}
-	return alloc_null();
 }
-DEFINE_PRIM(lua_load_libs, 2);
+DEFINE_PRIME2v(lua_load_libs);
 
-static value lua_load_context(value inHandle, value inContext)
+static void lua_load_context(value inHandle, value inContext)
 {
 	lua_State *l = lua_from_handle(inHandle);
 	if (l)
@@ -280,9 +334,8 @@ static value lua_load_context(value inHandle, value inContext)
 			val_iter_fields(inContext, haxe_iter_global, l);
 		}
 	}
-	return alloc_null();
 }
-DEFINE_PRIM(lua_load_context, 2);
+DEFINE_PRIME2v(lua_load_context);
 
 static value lua_call_function(value inHandle, value inFunction, value inArgs)
 {
@@ -299,7 +352,14 @@ static value lua_call_function(value inHandle, value inFunction, value inArgs)
 			value *args = val_array_value(inArgs);
 			for (int i = 0; i < numArgs; i++)
 			{
-				haxe_to_lua(args[i], l);
+				if(args)
+				{
+					haxe_to_lua(args[i], l);
+				}
+				else
+				{
+					haxe_to_lua(val_array_i(inArgs,i), l);
+				}
 			}
 		}
 		else
@@ -316,7 +376,7 @@ static value lua_call_function(value inHandle, value inFunction, value inArgs)
 	}
 	return alloc_null();
 }
-DEFINE_PRIM(lua_call_function, 3);
+DEFINE_PRIME3(lua_call_function);
 
 static value lua_execute(value inHandle, value inScript)
 {
@@ -345,11 +405,123 @@ static value lua_execute(value inHandle, value inScript)
 	}
 	return alloc_null();
 }
-DEFINE_PRIM(lua_execute, 2);
+DEFINE_PRIME2(lua_execute);
+
+// Lua helpers
+static value _lua_setmetatable(value inHandle, value objindex)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l == NULL) return alloc_int(0);
+
+	return alloc_int(lua_setmetatable(l, val_int(objindex)));
+}
+DEFINE_PRIME2(_lua_setmetatable);
+
+static value print_fn;
+
+static int hx_trace(lua_State* L) {
+	std::stringstream buffer;
+	int n = lua_gettop(L);  /* number of arguments */
+
+	lua_getglobal(L,"tostring");
+
+	for ( int i = 1;  i <= n;  ++i ){
+		const char* s = NULL;
+		size_t      l = 0;
+
+		lua_pushvalue(L,-1);    /* function to be called */
+		lua_pushvalue(L,i); /* value to print */
+		lua_call(L,1,1);
+
+		s = lua_tolstring(L,-1, &l); /* get result */
+		if ( s == NULL ){
+			return luaL_error(L,LUA_QL("tostring") " must return a string to " LUA_QL("print"));
+		}
+
+		if ( i>1 ){
+			buffer << "\t";
+		}
+
+		buffer << s;
+
+		lua_pop(L,1);   /* pop result */
+	}
+
+	// std::cout << buffer.str(); // c++ out
+	val_call1(print_fn, alloc_string(buffer.str().c_str())); // hxout
+
+	return 0;
+}
+
+static const struct luaL_Reg printlib [] = {
+	{"print", hx_trace},
+	{NULL, NULL} /* end of array */
+};
+
+void register_hxtrace_func(value fn){
+	print_fn = fn;
+}
+DEFINE_PRIME1v(register_hxtrace_func);
+
+void register_hxtrace_lib(value inHandle){
+	lua_State *l = lua_from_handle(inHandle);
+	if (l == NULL) return;
+
+	//lua_getglobal(l, "_G");
+	//luaL_register(L, NULL, printlib);
+	//luaL_openlib(L,NULL,printlib,0);
+	luaL_requiref(l, "print", hx_trace, 1);
+	lua_settop(l, 0);
+	//lua_pop(l, 1);
+}
+DEFINE_PRIME1v(register_hxtrace_lib);
+
+// callbacks
+static value event_fn = 0;
+static int luaCallback(lua_State *L){
+	return val_int(val_call1(event_fn, alloc_string(lua_tostring(L, lua_upvalueindex(1)))));
+}
+
+void set_callbacks_function(value fn){
+	event_fn = fn;
+}
+DEFINE_PRIME1v(set_callbacks_function);
+
+void add_callback_function(value inHandle, value _name) {
+	lua_State *l = lua_from_handle(inHandle);
+	if (l == NULL) return;
+	const char* name = val_string(_name);
+	lua_pushstring(l, name);
+	lua_pushcclosure(l, luaCallback, 1);
+	lua_setglobal(l, name);
+}
+DEFINE_PRIME2v(add_callback_function);
+
+void remove_callback_function(value inHandle, value _name){
+	lua_State *l = lua_from_handle(inHandle);
+	if (l == NULL) return;
+	const char* name = val_string(_name);
+	lua_pushnil(l);
+	lua_setglobal(l, name);
+}
+DEFINE_PRIME2v(remove_callback_function);
+
+void openlibs(value inHandle){
+	lua_State *l = lua_from_handle(inHandle);
+	if (l == NULL) return;
+	luaL_openlibs(l);
+}
+DEFINE_PRIME1v(openlibs);
+void setglobal(value inHandle, value name){
+	lua_State *l = lua_from_handle(inHandle);
+	if (l == NULL) return;
+	lua_setglobal(l, val_string(name));
+}
+DEFINE_PRIME2v(setglobal);
 
 extern "C" void lua_main()
 {
-	kind_share(&kind_lua_vm, "lua::vm"); // Fix Neko init
+	kind_share(&kind_lua_vm, "lua::vm");
 }
 DEFINE_ENTRY_POINT(lua_main);
 
